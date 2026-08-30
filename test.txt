@@ -1,0 +1,260 @@
+Good question! Let me break this down based on your current setup.
+
+Short answer: Yes, it's possible, but it depends on what exactly you mean and what layer you're working at.
+
+Your current setup has two VMs peering via eBGP using their private IPs (the <BGP_PRIVATE_IP> and <ISP_PRIVATE_IP> placeholders in frr.conf). Here are the scenarios:
+
+1. If both VMs are in the same VPC/subnet (e.g., AWS, Azure, GCP)
+
+You don't need NAT for the BGP peering itself since both VMs can reach each other directly via private IPs. The BGP neighbor relationship uses private IPs and that's fine — this is how it's typically done in cloud environments.
+
+If your sir is asking about showing the public/NAT IP as the BGP router-id or next-hop to external clients, that's a different matter:
+
+Router-ID: Can be set to anything (it's just an identifier), so you could set it to the NAT/public IP, but there's no functional reason to.
+Next-hop (route-map SET_SINKHOLE_NH): The next-hop you advertise should be reachable by the peer. If the ISP-VM is in the same private network, use the private IP. If it's across the internet, then yes, you'd use the public/NAT IP.
+2. If VMs are in different networks (across the internet)
+
+If bgp-vm and isp-vm are in different clouds/datacenters and can only reach each other via public IPs, then yes — you'd configure the BGP neighbor using the public/NAT IP instead of the private IP:
+
+text
+
+# On bgp-vm's frr.conf
+neighbor <ISP_PUBLIC_NAT_IP> remote-as 65002
+
+# On isp-vm's frr.conf
+neighbor <BGP_PUBLIC_NAT_IP> remote-as 65001
+But there's a catch: NAT breaks BGP by default because BGP uses TCP port 179, and the source IP in the TCP session won't match the configured neighbor IP after NAT translation. To handle this:
+
+Use ebgp-multihop (you already have this)
+Use update-source to bind to the right interface
+Make sure the NAT is 1:1 static NAT (not PAT/masquerade), so the mapping is consistent
+Ensure the security group / firewall allows TCP 179 both ways on the public IP
+3. If the question is about the sinkhole_api.py / Flask app
+
+The Flask app already binds to 0.0.0.0:5000, so if your VM has a public/NAT IP with port 5000 allowed in the security group, clients can access it via the NAT IP. The app itself doesn't care whether the client comes in through a private or NAT IP — it's purely a network layer concern handled by the cloud provider's NAT gateway or elastic IP.
+
+TL;DR for your sir:
+
+Scenario	Can you use NAT IP?	What to change
+BGP peering across internet	Yes, use static 1:1 NAT	Change neighbor IPs in frr.conf to public/NAT IPs
+BGP peering same VPC	Not needed, private IPs work	Nothing
+Flask UI access from outside	Already works via NAT/public IP	Just open port 5000 in security group
+Sinkhole next-hop	Must be reachable by peer, so use private if same network	Only change if peering is cross-network
+The key constraint is: BGP neighbors must be able to reach each other's configured neighbor IP directly (after any NAT translation). A 1:1 static NAT (like an AWS Elastic IP) works fine. Symmetric PAT/masquerade NAT will cause issues because the return traffic won't match.
+
+Est. Credits Used: 0.31
+Elapsed time: 33s
+
+
+Checkpoint
+Restore
+No nat is at client side I need client side natted ip instead of private ip
+
+Kiro
+Ah, I see now. You want to log/display the client's public (NATted) IP when they connect to your Flask app, instead of seeing their private IP.
+
+The problem: When a client behind NAT hits your Flask app, Flask sees the IP that actually made the TCP connection. If there's a reverse proxy or load balancer in between, you'll see the proxy's IP. If the client connects directly through a cloud NAT gateway, Flask should already see the NAT IP (because that's what arrives at your VM).
+
+So the real question is: what's between the client and your Flask app?
+
+Case 1: Client connects directly through internet (cloud NAT / Elastic IP on client side)
+
+In this case, request.remote_addr in Flask will already show the client's public/NATted IP. You don't need to change anything — the NAT translation happens before the packet reaches your VM, so you see the post-NAT IP.
+
+Case 2: There's a reverse proxy / load balancer in front of your Flask app (e.g., AWS ALB, Nginx)
+
+The proxy forwards the request, so request.remote_addr shows the proxy's IP. The real client IP is in the X-Forwarded-For header. To get it:
+
+python
+
+from flask import request
+
+client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+# X-Forwarded-For can be "client_ip, proxy1, proxy2" — take the first one
+if client_ip:
+    client_ip = client_ip.split(',')[0].strip()
+Or use Flask's built-in support with ProxyFix:
+
+python
+
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+# Now request.remote_addr will return the client's real IP
+Case 3: Client is in the same VPC / private network (no NAT in between)
+
+If the client is in the same private network and connects directly, there's no NAT happening — so there's no "NATted IP" to get. You'd only see the private IP because that's the reality of the connection. You can't get a public IP that doesn't exist in the packet path.
+
+Most likely your situation: If clients access the Flask app via the internet (through their own corporate/home NAT), Flask's request.remote_addr already gives you their NATted public IP. That's how NAT works — by the time the packet reaches your server, the source IP is already the NAT IP.
+
+If you're seeing private IPs, it likely means there's a load balancer or proxy in front of your app stripping the real IP. In that case, use the X-Forwarded-For approach above.
+
+Want me to add client IP logging to your sinkhole_api.py so you can verify what IP you're actually receiving?
+
+Est. Credits Used: 0.15
+Elapsed time: 18s
+
+
+Checkpoint
+Restore
+Flask app is diff read my readme to understand the context
+
+Kiro
+
+1 tool call
+Read File
+
+README.md
+Got it, now I understand the full picture. Let me re-read the key note you already have in your README:
+
+"Source IP is private — AWS public IPs (EIPs) are NAT'd at the IGW. Since traffic stays inside the VPC, the public IP never appears in packets."
+
+This is the core of your sir's question. Here's the answer:
+
+No, you cannot get the client's NAT/public IP in the sinkhole capture with the current setup, and here's why:
+
+The traffic flow is entirely inside the VPC:
+
+
+client (172.31.3.154) → isp-vm → sinkhole-vm
+The packet never leaves the VPC, so it never hits the Internet Gateway (IGW). AWS NAT (EIP mapping) only happens at the IGW boundary. Since the traffic is redirected to the sinkhole before it ever reaches the IGW, the source IP in the packet will always be the client's private IP.
+
+Your options to get the public/NAT IP:
+
+Option 1: Post-capture mapping (recommended, what you already noted in README)
+
+After you capture the private IP at the sinkhole, map it to the public IP using the AWS API:
+
+bash
+
+aws ec2 describe-instances \
+  --filters "Name=private-ip-address,Values=172.31.3.154" \
+  --query "Reservations[*].Instances[*].[PublicIpAddress]" \
+  --output text --region ap-south-1
+This is clean and doesn't require any architecture change. You could add this as a lookup step in your sinkhole processing script.
+
+Option 2: Put a NAT Gateway in the traffic path
+
+You'd need to route client traffic out of the VPC through the IGW/NAT-GW and then back in — essentially hairpinning. This would be extremely convoluted, add latency, cost money (NAT Gateway charges), and defeats the elegance of your in-VPC design. Not recommended.
+
+Option 3: Add iptables SNAT on isp-vm
+
+You could SNAT client traffic on isp-vm to the client's public IP before forwarding to sinkhole. But this requires maintaining a private→public IP mapping table on isp-vm, and your README explicitly says "No SNAT/MASQUERADE — source IP is preserved end-to-end" as a design principle. Also, where would isp-vm even learn the mapping from? It doesn't know clients' EIPs.
+
+TL;DR for your sir:
+
+It's not possible to see the NAT/public IP in the captured packets because the traffic never crosses the NAT boundary (IGW). The correct approach is to capture the private IP and then resolve it to the public IP via the AWS API (describe-instances or describe-network-interfaces). This is a standard practice in VPC-based security monitoring — tools like VPC Flow Logs also only show private IPs for intra-VPC traffic.
+
+Est. Credits Used: 0.29
+Elapsed time: 26s
+
+
+Checkpoint
+Restore
+Can't I use my client vm as nat instance and connect 2 more vms to it and do the natting to get same ip for both?
+
+Kiro
+Yes, absolutely — that's a valid approach and it works well with your current setup.
+
+The idea: Turn your client VM into a NAT instance. Put 2 (or more) VMs behind it in a private subnet. Those VMs use the client VM as their default gateway. Client VM does MASQUERADE/SNAT, so all traffic from those backend VMs appears to come from the client VM's private IP.
+
+From the sinkhole's perspective, both backend VMs show up as the same source IP (the client/NAT VM's private IP) — which proves the NAT concept.
+
+Here's how it would look:
+
+
+                         ┌──────────────┐
+                         │  client-vm   │
+                         │ (NAT instance)│
+                         │ 172.31.3.154 │
+                         │  MASQUERADE  │
+                         └──────┬───────┘
+                                │
+                    ┌───────────┼───────────┐
+                    │                       │
+             ┌──────┴──────┐        ┌──────┴──────┐
+             │  vm-behind-1│        │  vm-behind-2│
+             │ 10.0.1.10   │        │ 10.0.1.20   │
+             └─────────────┘        └─────────────┘
+
+Both VMs' traffic → client-vm (NAT) → isp-vm → sinkhole
+Sinkhole sees source IP: 172.31.3.154 for BOTH
+Steps to set this up:
+
+1. Create a new private subnet for the backend VMs
+
+bash
+
+aws ec2 create-subnet --vpc-id <VPC_ID> --cidr-block 10.0.1.0/24 --availability-zone <SAME_AZ_AS_CLIENT> --region <REGION>
+2. Route table for the private subnet → client VM as gateway
+
+bash
+
+aws ec2 create-route-table --vpc-id <VPC_ID> --region <REGION>
+# All traffic goes through client-vm
+aws ec2 create-route --route-table-id <NEW_RT_ID> --destination-cidr-block 0.0.0.0/0 --instance-id <CLIENT_INSTANCE_ID> --region <REGION>
+aws ec2 associate-route-table --route-table-id <NEW_RT_ID> --subnet-id <NEW_SUBNET_ID> --region <REGION>
+3. Disable source/dest check on client VM
+
+bash
+
+aws ec2 modify-instance-attribute --instance-id <CLIENT_INSTANCE_ID> --no-source-dest-check --region <REGION>
+4. Enable NAT (MASQUERADE) on client VM
+
+bash
+
+# On client-vm:
+sudo sysctl -w net.ipv4.ip_forward=1
+echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
+
+# MASQUERADE all traffic from the private subnet
+sudo iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o ens5 -j MASQUERADE
+sudo iptables -A FORWARD -i ens5 -o ens5 -j ACCEPT
+5. Launch 2 VMs in the new private subnet (10.0.1.10, 10.0.1.20)
+
+No public IP needed — they route through client-vm.
+
+6. Test from both backend VMs
+
+bash
+
+# From vm-behind-1 (10.0.1.10):
+ping -c 3 198.51.100.1
+
+# From vm-behind-2 (10.0.1.20):
+ping -c 3 198.51.100.1
+7. Check sinkhole capture
+
+
+IP 172.31.3.154 > 198.51.100.1: ICMP echo request  (from vm-behind-1)
+IP 172.31.3.154 > 198.51.100.1: ICMP echo request  (from vm-behind-2)
+Both show 172.31.3.154 (client-vm's IP) — the NAT is working.
+
+This proves the point your sir is asking about: Multiple machines behind a NAT all appear as one IP at the sinkhole. In a real-world scenario, this is what happens when an organization's internal machines go through a corporate NAT/firewall — you see the NAT IP in the capture, not individual machine IPs.
+
+The existing traffic path stays the same — client-vm's traffic still goes through isp-vm to sinkhole via BGP routes. You're just adding a NAT layer upstream of the existing client-vm.
+
+Then everything works the way you want, and nothing breaks. Here's exactly what happens with only the sinkhole-scoped rule:
+
+sudo iptables -t nat -A POSTROUTING -o ens5 -d <SINKHOLE_PRIVATE_IP> -j SNAT --to-source <ISP_PRIVATE_IP>
+Malicious traffic (client → malicious IP):
+
+Client sends to e.g. 198.51.100.1.
+isp-vm forwards it toward the sinkhole (next-hop = sinkhole IP), so destination becomes the sinkhole and it egresses ens5.
+The rule matches (-d <SINKHOLE_PRIVATE_IP>), so the source gets rewritten to <ISP_PRIVATE_IP>.
+Sinkhole captures it with the NAT'd source. All clients show the same fixed IP. This is what your sir wants.
+Legitimate traffic (client → real internet):
+
+Client sends to some real site.
+isp-vm forwards it to the VPC gateway/internet, destination is not the sinkhole.
+The rule does not match, so no SNAT. Traffic passes through untouched, source stays the client's real IP.
+Nothing breaks.
+Maintenance when prefixes change:
+
+All malicious prefixes resolve to the same next-hop (sinkhole), so they all hit this one rule.
+Add or remove prefixes via BGP/the Flask UI as much as you like — the rule never needs updating. It matches on the sinkhole destination, not on any specific malicious prefix.
+So with only the sinkhole-scoped rule:
+
+Sinkhole sees a single fixed NAT'd IP for all clients. ✓
+Legitimate traffic is untouched. ✓
+Zero maintenance as prefixes come and go. ✓
+The only "limitation" is the one that's inherent to any fixed-IP NAT: at the sinkhole you can't tell clients apart anymore (they all look like <ISP_PRIVATE_IP>). That's the exact behavior your sir asked for, so it's fine. This is the clean setup to go with.
